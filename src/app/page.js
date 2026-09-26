@@ -18,10 +18,12 @@ import {
   validateBet,
 } from "@/lib/validation";
 
+// Wait for a tx to finalize and surface a readable error if execution failed.
 async function waitAndCheck(hash) {
-  const receipt = await client.waitForTransactionReceipt({ hash });
-  if (receipt.txExecutionResultName === "FINISHED_WITH_ERROR") {
-    throw new Error("Transaction executed but failed on-chain. Check inputs and try again.");
+  const receipt = await client.waitForTransactionReceipt({ hash, fullTransaction: true });
+  const result = receipt.consensus_data?.leader_receipt?.[0]?.result;
+  if (result?.status === "contract_error") {
+    throw new Error("Transaction was rejected by the contract. Check your inputs and try again.");
   }
   return receipt;
 }
@@ -42,6 +44,7 @@ export default function Home() {
   const [userDuration, setUserDuration] = useState("24");
 
   const [betAmounts, setBetAmounts] = useState({});
+  const [funding, setFunding] = useState(false);
 
   const loadMarkets = useCallback(async () => {
     setLoadingMarkets(true);
@@ -59,6 +62,38 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time initial fetch on mount, no race condition (refresh button re-triggers outside this effect)
     loadMarkets();
   }, [loadMarkets]);
+
+  useEffect(() => {
+    if (!wallet) return;
+    let cancelled = false;
+
+    async function autoFund() {
+      try {
+        const balance = await client.getBalance({ address: wallet.address });
+        if (balance > 0n || cancelled) return;
+
+        setFunding(true);
+        const res = await fetch("/api/fund", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ address: wallet.address }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          console.error("Auto-fund failed:", data.error);
+        }
+      } catch (err) {
+        console.error("Auto-fund error:", err.message);
+      } finally {
+        if (!cancelled) setFunding(false);
+      }
+    }
+
+    autoFund();
+    return () => {
+      cancelled = true;
+    };
+  }, [wallet]);
 
   async function handleCreateAi(e) {
     e.preventDefault();
@@ -190,10 +225,12 @@ export default function Home() {
         {wallet && (
           <div className="text-xs bg-slate-900 border border-slate-800 rounded p-2 break-all">
             Your wallet: <span className="text-emerald-400">{wallet.address}</span>
+            {funding && <span className="text-amber-400"> · funding your wallet with test GEN...</span>}
             <br />
             <span className="text-slate-500">
               This address only exists in this browser. Clearing site data or switching
-              devices loses access to any funds sent here.
+              devices loses access to any funds sent here. This is a GenLayer Studio demo;
+              you were automatically given test GEN to try betting.
             </span>
           </div>
         )}

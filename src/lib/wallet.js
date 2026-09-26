@@ -3,10 +3,8 @@ import { createAccount, generatePrivateKey } from "genlayer-js";
 
 const STORAGE_KEY = "genlayer_prediction_wallet_pk";
 
-// Get existing wallet from localStorage, or generate + persist a new one.
 export function getOrCreateWallet() {
   if (typeof window === "undefined") return null;
-
   try {
     let privateKey = window.localStorage.getItem(STORAGE_KEY);
     if (!privateKey) {
