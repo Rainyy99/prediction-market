@@ -10,7 +10,9 @@ import {
   resolveMarket,
   claimBet,
   client,
+  getReturnValue,
 } from "@/lib/genlayer";
+import { fetchMyBets, recordBetPointer } from "@/lib/bets";
 import {
   SUPPORTED_ASSETS,
   validateAiMarket,
@@ -29,12 +31,12 @@ async function waitAndCheck(hash) {
 }
 
 export default function Home() {
-  const [wallet] = useState(() => getOrCreateWallet());
+  const [wallet, setWallet] = useState(null);
   const [markets, setMarkets] = useState([]);
   const [loadingMarkets, setLoadingMarkets] = useState(true);
   const [busy, setBusy] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
-  const [showCreate, setShowCreate] = useState(null);
+  const [showCreate, setShowCreate] = useState(null); // "ai" | "user" | null
 
   const [aiAsset, setAiAsset] = useState(SUPPORTED_ASSETS[0]);
   const [aiDuration, setAiDuration] = useState("24");
@@ -45,6 +47,8 @@ export default function Home() {
 
   const [betAmounts, setBetAmounts] = useState({});
   const [funding, setFunding] = useState(false);
+  const [myBets, setMyBets] = useState([]);
+  const [loadingBets, setLoadingBets] = useState(false);
 
   const loadMarkets = useCallback(async () => {
     setLoadingMarkets(true);
@@ -56,6 +60,25 @@ export default function Home() {
     } finally {
       setLoadingMarkets(false);
     }
+  }, []);
+
+  const loadMyBets = useCallback(async () => {
+    if (!wallet) return;
+    setLoadingBets(true);
+    try {
+      const marketsById = new Map(markets.map((m) => [m.id, m]));
+      const bets = await fetchMyBets(wallet.address, marketsById);
+      setMyBets(bets);
+    } catch (err) {
+      console.error("Failed to load my bets:", err.message);
+    } finally {
+      setLoadingBets(false);
+    }
+  }, [wallet, markets]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberately deferred to client-only effect to avoid SSR hydration mismatch (localStorage doesn't exist on the server)
+    setWallet(getOrCreateWallet());
   }, []);
 
   useEffect(() => {
@@ -94,6 +117,11 @@ export default function Home() {
       cancelled = true;
     };
   }, [wallet]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- re-derives bet statuses whenever markets refresh; no race (guarded by loadingBets not being awaited elsewhere)
+    loadMyBets();
+  }, [loadMyBets]);
 
   async function handleCreateAi(e) {
     e.preventDefault();
@@ -173,7 +201,12 @@ export default function Home() {
     setStatusMsg(`Placing ${side} bet...`);
     try {
       const hash = await placeBet({ account: wallet.account, marketId, side, amount });
-      await waitAndCheck(hash);
+      setStatusMsg("Waiting for confirmation...");
+      const receipt = await waitAndCheck(hash);
+      const returned = getReturnValue(receipt);
+      if (returned?.bet_id) {
+        recordBetPointer(wallet.address, { betId: returned.bet_id, marketId });
+      }
       setStatusMsg("Bet placed.");
       await loadMarkets();
     } catch (err) {
@@ -198,15 +231,14 @@ export default function Home() {
     }
   }
 
-  async function handleClaim(marketId) {
-    const betId = window.prompt("Enter your bet ID to claim:");
-    if (!betId) return;
+  async function handleClaim(betId) {
     setBusy(true);
     setStatusMsg("Claiming payout...");
     try {
       const hash = await claimBet({ account: wallet.account, betId });
       await waitAndCheck(hash);
       setStatusMsg("Claim submitted.");
+      await loadMyBets();
     } catch (err) {
       setStatusMsg("Error: " + err.message);
     } finally {
@@ -325,6 +357,39 @@ export default function Home() {
       )}
 
       <section className="space-y-4">
+        <h2 className="text-lg font-semibold">My Bets</h2>
+        {loadingBets && <p className="text-sm text-slate-500">Loading your bets...</p>}
+        {!loadingBets && myBets.length === 0 && (
+          <p className="text-sm text-slate-500">You haven&apos;t placed any bets yet.</p>
+        )}
+        {myBets.map((b) => (
+          <div key={b.betId} className="bg-slate-900 border border-slate-800 rounded p-3 flex items-center justify-between text-sm">
+            <div>
+              <span className="font-medium">{b.marketTitle}</span>
+              <span className="text-slate-500"> · bet #{b.betId} · {b.side}</span>
+              <br />
+              <span className={
+                b.status === "WON_UNCLAIMED" ? "text-emerald-400" :
+                b.status === "CLAIMED" ? "text-slate-400" :
+                b.status === "LOST" ? "text-rose-400" :
+                "text-amber-400"
+              }>
+                {b.status === "WON_UNCLAIMED" ? "Won -- ready to claim" :
+                 b.status === "CLAIMED" ? "Won -- already claimed" :
+                 b.status === "LOST" ? "Lost" :
+                 "Pending -- market not resolved yet"}
+              </span>
+            </div>
+            {b.status === "WON_UNCLAIMED" && (
+              <button disabled={busy} onClick={() => handleClaim(b.betId)} className="text-xs px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50">
+                Claim
+              </button>
+            )}
+          </div>
+        ))}
+      </section>
+
+      <section className="space-y-4">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Markets</h2>
           <button onClick={loadMarkets} className="text-xs text-slate-400 hover:text-slate-200">
@@ -386,12 +451,6 @@ export default function Home() {
             {m.status === "OPEN" && m.aiPosition && m.isPastDeadline && (
               <button disabled={busy} onClick={() => handleResolve(m.id)} className="text-xs px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 disabled:opacity-50">
                 Resolve now
-              </button>
-            )}
-
-            {m.status === "RESOLVED" && (
-              <button disabled={busy} onClick={() => handleClaim(m.id)} className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50">
-                Claim a winning bet
               </button>
             )}
           </div>
